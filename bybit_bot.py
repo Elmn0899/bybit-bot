@@ -8,8 +8,8 @@ TELEGRAM_TOKEN = "8032574245:AAHkuQCLeExNB5WSdxcsIXxrjirjAXL5IHU"
 CHAT_ID = "732160810"
 CHECK_INTERVAL = 60
 TIMEFRAME = "5"
-CANDLES_TO_FETCH = 30
-COOLDOWN_MINUTES = 60
+CANDLES_TO_FETCH = 40
+COOLDOWN_MINUTES = 180  # 3 часа между сигналами по одной монете
 
 HEADERS = {
     "User-Agent": "python-requests/2.31.0",
@@ -22,7 +22,13 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 log = logging.getLogger(__name__)
+
+# {symbol: timestamp}
 last_alerts = {}
+
+# Отслеживание результатов сигналов
+# {symbol: {"time": datetime, "price": float, "checked_30": bool, "checked_60": bool}}
+active_signals = {}
 
 
 def send_telegram(message):
@@ -39,6 +45,78 @@ def send_telegram(message):
             log.error(f"Telegram error: {r.status_code}")
     except Exception as e:
         log.error(f"Telegram exception: {e}")
+
+
+def get_current_price(symbol):
+    url = "https://api.bybit.com/v5/market/tickers"
+    try:
+        r = requests.get(url, headers=HEADERS, params={
+            "category": "linear",
+            "symbol": symbol
+        }, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("retCode") == 0:
+                return float(data["result"]["list"][0]["lastPrice"])
+    except Exception:
+        pass
+    return None
+
+
+def check_signal_results():
+    """Проверяем результаты прошлых сигналов и отправляем отчёт"""
+    now = datetime.now()
+    to_remove = []
+
+    for symbol, info in active_signals.items():
+        elapsed_min = (now - info["time"]).total_seconds() / 60
+
+        # Отчёт через 30 минут
+        if elapsed_min >= 30 and not info.get("checked_30"):
+            current = get_current_price(symbol)
+            if current:
+                signal_price = info["price"]
+                change_pct = (signal_price - current) / signal_price * 100
+                direction = "📉 упала" if change_pct > 0 else "📈 выросла"
+                emoji = "✅" if change_pct > 0 else "❌"
+
+                send_telegram(
+                    f"{emoji} <b>ОТЧЁТ 30 минут</b>\n\n"
+                    f"📌 <b>{symbol}</b>\n"
+                    f"💰 Цена сигнала: {signal_price}\n"
+                    f"💰 Цена сейчас: {current}\n"
+                    f"📊 Цена {direction} на: <b>{abs(change_pct):.2f}%</b>\n"
+                    f"⏰ Прошло: 30 минут"
+                )
+                active_signals[symbol]["checked_30"] = True
+                time.sleep(0.5)
+
+        # Отчёт через 60 минут
+        if elapsed_min >= 60 and not info.get("checked_60"):
+            current = get_current_price(symbol)
+            if current:
+                signal_price = info["price"]
+                change_pct = (signal_price - current) / signal_price * 100
+                direction = "📉 упала" if change_pct > 0 else "📈 выросла"
+                emoji = "✅" if change_pct > 0 else "❌"
+
+                send_telegram(
+                    f"{emoji} <b>ОТЧЁТ 1 час</b>\n\n"
+                    f"📌 <b>{symbol}</b>\n"
+                    f"💰 Цена сигнала: {signal_price}\n"
+                    f"💰 Цена сейчас: {current}\n"
+                    f"📊 Цена {direction} на: <b>{abs(change_pct):.2f}%</b>\n"
+                    f"⏰ Прошло: 1 час"
+                )
+                active_signals[symbol]["checked_60"] = True
+                time.sleep(0.5)
+
+        # Удаляем после 2 часов
+        if elapsed_min >= 120:
+            to_remove.append(symbol)
+
+    for s in to_remove:
+        active_signals.pop(s, None)
 
 
 def get_all_symbols():
@@ -95,56 +173,66 @@ def get_candles(symbol):
 
 def detect_pattern(candles):
     """
-    Паттерн истощения:
-    1. Был рост до паттерна
-    2. Последние 4 свечи: цена загибается вниз
-    3. Свечи становятся меньше (затухание)
-    4. Объём падает вместе со свечами
-    5. Цена ниже локального максимума
+    МАКСИМАЛЬНО СТРОГИЙ паттерн:
+    1. Явный рост минимум 3% до паттерна
+    2. Все 4 свечи закрываются строго ниже
+    3. Каждая свеча меньше предыдущей (постепенное затухание)
+    4. Свечи уменьшились в 3x по сравнению с периодом роста
+    5. Объём упал в 3x
+    6. Цена ниже максимума минимум на 1%
+    7. Последняя свеча очень маленькая (меньше 30% от среднего)
     """
-    if len(candles) < 15:
+    if len(candles) < 20:
         return False
 
     last4 = candles[-4:]
-    before = candles[-14:-4]
+    before = candles[-18:-4]
 
-    # --- 1. До паттерна был рост ---
-    price_low = min(c["low"] for c in before[:5])
+    # --- 1. Явный рост минимум 3% ---
+    price_low = min(c["low"] for c in before[:6])
     price_peak = max(c["high"] for c in before)
     growth = (price_peak - price_low) / price_low if price_low > 0 else 0
-    if growth < 0.008:  # минимум 0.8% рост
+    if growth < 0.03:
         return False
 
-    # --- 2. Изгиб вниз: последние 4 свечи закрываются ниже ---
+    # --- 2. ВСЕ 4 свечи строго ниже ---
     closes = [c["close"] for c in last4]
-    descending = sum(1 for i in range(1, len(closes)) if closes[i] < closes[i-1])
-    if descending < 2:  # хотя бы 2 из 3 переходов вниз
+    if not all(closes[i] < closes[i-1] for i in range(1, len(closes))):
         return False
 
-    # --- 3. Затухание свечей ---
+    # --- 3. Каждая свеча меньше предыдущей (затухание) ---
     ranges = [c["range"] for c in last4]
+    if not all(ranges[i] < ranges[i-1] for i in range(1, len(ranges))):
+        return False
+
+    # --- 4. Свечи уменьшились в 3x ---
     avg_range_before = sum(c["range"] for c in before) / len(before)
     avg_range_last4 = sum(ranges) / len(ranges)
-    if avg_range_before == 0:
+    if avg_range_before == 0 or avg_range_last4 == 0:
         return False
-    candle_ratio = avg_range_before / avg_range_last4
-    if candle_ratio < 1.5:  # свечи должны быть в 1.5x меньше
+    if avg_range_before / avg_range_last4 < 3.0:
         return False
 
-    # --- 4. Объём падает ---
+    # --- 5. Объём упал в 3x ---
     avg_vol_before = sum(c["volume"] for c in before) / len(before)
     avg_vol_last4 = sum(c["volume"] for c in last4) / len(last4)
-    if avg_vol_before == 0:
+    if avg_vol_before == 0 or avg_vol_last4 == 0:
         return False
-    vol_ratio = avg_vol_before / avg_vol_last4
-    if vol_ratio < 1.5:  # объём должен упасть в 1.5x
+    if avg_vol_before / avg_vol_last4 < 3.0:
         return False
 
-    # --- 5. Цена ниже локального максимума ---
+    # --- 6. Цена ниже максимума минимум на 1% ---
     current_price = candles[-1]["close"]
-    local_max = max(c["high"] for c in candles[-14:])
+    local_max = max(c["high"] for c in candles[-18:])
     below_max = (local_max - current_price) / local_max if local_max > 0 else 0
-    if below_max < 0.003:
+    if below_max < 0.01:
+        return False
+
+    # --- 7. Последняя свеча очень маленькая ---
+    last_range = candles[-1]["range"]
+    if avg_range_before == 0:
+        return False
+    if last_range / avg_range_before > 0.25:  # должна быть меньше 25% от среднего
         return False
 
     return True
@@ -160,7 +248,7 @@ def is_in_cooldown(symbol):
 def format_alert(symbol, candles):
     last = candles[-1]
     last4 = candles[-4:]
-    before = candles[-14:-4]
+    before = candles[-18:-4]
 
     avg_range_before = sum(c["range"] for c in before) / len(before) if before else 1
     avg_range_last = sum(c["range"] for c in last4) / len(last4) if last4 else 1
@@ -170,18 +258,22 @@ def format_alert(symbol, candles):
     avg_vol_last = sum(c["volume"] for c in last4) / len(last4) if last4 else 1
     vol_ratio = avg_vol_before / avg_vol_last if avg_vol_last > 0 else 0
 
-    local_max = max(c["high"] for c in candles[-14:])
+    local_max = max(c["high"] for c in candles[-18:])
     drop_pct = (local_max - last["close"]) / local_max * 100
+
+    price_low = min(c["low"] for c in before[:6])
+    growth_pct = (local_max - price_low) / price_low * 100
 
     return (
         f"🔴 <b>ШОРТ СИГНАЛ</b>\n\n"
         f"📌 <b>{symbol}</b>\n"
-        f"💰 Цена: <b>{last['close']}</b>\n"
-        f"📉 Ниже максимума: {drop_pct:.2f}%\n"
-        f"🕯 Свечи меньше в: {candle_ratio:.1f}x\n"
-        f"📊 Объём упал в: {vol_ratio:.1f}x\n"
-        f"⏰ {datetime.now().strftime('%H:%M:%S')}\n\n"
-        f"Дуга вниз + затухание + падение объёма"
+        f"💰 Цена входа: <b>{last['close']}</b>\n\n"
+        f"📈 Рост до паттерна: {growth_pct:.1f}%\n"
+        f"📉 Откат от максимума: {drop_pct:.2f}%\n"
+        f"🕯 Свечи уменьшились в: {candle_ratio:.1f}x\n"
+        f"📊 Объём упал в: {vol_ratio:.1f}x\n\n"
+        f"⏰ {datetime.now().strftime('%H:%M:%S')}\n"
+        f"<i>Отчёт придёт через 30 мин и 1 час</i>"
     )
 
 
@@ -197,6 +289,12 @@ def scan_all_symbols(symbols):
             msg = format_alert(symbol, candles)
             send_telegram(msg)
             last_alerts[symbol] = datetime.now()
+            active_signals[symbol] = {
+                "time": datetime.now(),
+                "price": candles[-1]["close"],
+                "checked_30": False,
+                "checked_60": False
+            }
             alerts_sent += 1
             log.info(f"SIGNAL: {symbol}")
             time.sleep(0.5)
@@ -207,9 +305,9 @@ def scan_all_symbols(symbols):
 def main():
     log.info("Bot starting...")
     send_telegram(
-        "<b>Bybit Scanner v3 запущен!</b>\n\n"
-        "Паттерн: дуга вниз + затухание + падение объёма 🔴\n"
-        "Таймфрейм: 5м"
+        "<b>Bybit Scanner v4 запущен!</b>\n\n"
+        "Строгий паттерн: рост 3%+ → дуга вниз → затухание → объём x3\n"
+        "Отчёт по каждому сигналу через 30 мин и 1 час 📊"
     )
 
     symbols = []
@@ -217,6 +315,9 @@ def main():
 
     while True:
         try:
+            # Проверяем результаты прошлых сигналов
+            check_signal_results()
+
             if not symbols or cycle % 10 == 0:
                 new_symbols = get_all_symbols()
                 if new_symbols:
