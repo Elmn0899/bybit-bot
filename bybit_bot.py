@@ -59,19 +59,39 @@ def send_telegram(message: str):
 def get_all_symbols() -> list:
     """Получить все линейные фьючерсы с Bybit"""
     url = "https://api.bybit.com/v5/market/instruments-info"
+    symbols = []
+    cursor = None
+
     try:
-        r = requests.get(url, params={
-            "category": "linear",
-            "status": "Trading"
-        }, timeout=15)
-        data = r.json()
-        if data.get("retCode") == 0:
-            symbols = [
-                item["symbol"] for item in data["result"]["list"]
-                if item["symbol"].endswith("USDT")
-            ]
-            log.info(f"Найдено монет: {len(symbols)}")
-            return symbols
+        while True:
+            params = {
+                "category": "linear",
+                "status": "Trading",
+                "limit": 1000
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            r = requests.get(url, params=params, timeout=15)
+            text = r.text
+            data = r.json()
+
+            if data.get("retCode") == 0:
+                batch = [
+                    item["symbol"] for item in data["result"]["list"]
+                    if item["symbol"].endswith("USDT")
+                ]
+                symbols.extend(batch)
+                cursor = data["result"].get("nextPageCursor")
+                if not cursor:
+                    break
+            else:
+                log.error(f"Bybit API ошибка: {data}")
+                break
+
+        log.info(f"Найдено монет: {len(symbols)}")
+        return symbols
+
     except Exception as e:
         log.error(f"Ошибка получения монет: {e}")
     return []
